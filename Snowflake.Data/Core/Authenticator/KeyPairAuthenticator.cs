@@ -1,20 +1,21 @@
 using System;
-using System.Collections.Generic;
-using System.Text;
+using System.IO;
+using System.Linq;
+using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
-using Snowflake.Data.Log;
 using System.IdentityModel.Tokens.Jwt;
-using Snowflake.Data.Client;
-using System.Security.Cryptography;
-using System.IO;
-using Org.BouncyCastle.OpenSsl;
-using Org.BouncyCastle.Security;
+using Microsoft.IdentityModel.Tokens;
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.OpenSsl;
+using Org.BouncyCastle.Security;
 using Org.BouncyCastle.X509;
-using System.Security.Claims;
-using Microsoft.IdentityModel.Tokens;
+using Snowflake.Data.Client;
+using Snowflake.Data.Core;
+using Snowflake.Data.Log;
+
 namespace Snowflake.Data.Core.Authenticator
 {
     /// <summary>
@@ -25,6 +26,22 @@ namespace Snowflake.Data.Core.Authenticator
     {
         // The authenticator setting value to use to authenticate using key pair authentication.
         public const string AUTH_NAME = "snowflake_jwt";
+
+        // Retry configuration constants
+        private const int MaxAuthRetries = 3;
+        private const int JwtLifetimeSeconds = 60;
+        private const int InitialBackoffMs = 1000;
+        private const int MaxBackoffMs = 8000;
+
+        // Retryable Snowflake error codes for JWT authentication
+        private static readonly int[] s_retryableSnowflakeCodes = {
+            394303,  // JWT_TOKEN_INVALID_EXPIRATION_TIME
+            394304,  // JWT_TOKEN_INVALID_PUBLIC_KEY_FINGERPRINT_MISMATCH
+            390144,  // JWT_TOKEN_INVALID
+        };
+
+        // Retryable HTTP status codes
+        private static readonly int[] s_retryableHttpCodes = { 500, 502, 503, 504, 408, 429 };
 
         // The logger.
         private static readonly SFLogger logger =
@@ -52,38 +69,131 @@ namespace Snowflake.Data.Core.Authenticator
         /// <see cref="IAuthenticator.AuthenticateAsync"/>
         async public Task AuthenticateAsync(CancellationToken cancellationToken)
         {
-            jwtToken = GenerateJwtToken();
+            Exception lastException = null;
+            int backoffMs = InitialBackoffMs;
 
-            // Send the http request with the generate token
-            logger.Debug("Send login request");
-            await base.LoginAsync(cancellationToken).ConfigureAwait(false);
+            for (int attempt = 1; attempt <= MaxAuthRetries; attempt++)
+            {
+                try
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // Generate fresh JWT token on every attempt (like Python connector)
+                    jwtToken = GenerateJwtToken();
+
+                    logger.Info($"JWT Authentication async attempt {attempt}/{MaxAuthRetries}");
+                    await base.LoginAsync(cancellationToken).ConfigureAwait(false);
+
+                    logger.Info("JWT Authentication successful");
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (SnowflakeDbException ex) when (ShouldRetry(ex, attempt))
+                {
+                    lastException = ex;
+                    logger.Warn($"JWT auth async attempt {attempt} failed with error {ex.ErrorCode}: {ex.Message}. Retrying with fresh token.");
+
+                    if (attempt < MaxAuthRetries)
+                    {
+                        int sleepTime = CalculateBackoff(backoffMs);
+                        logger.Debug($"Waiting {sleepTime}ms before retry...");
+                        await Task.Delay(sleepTime, cancellationToken).ConfigureAwait(false);
+                        backoffMs = Math.Min(backoffMs * 2, MaxBackoffMs);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.Error($"JWT Authentication async failed with non-retryable error: {ex.Message}", ex);
+                    throw;
+                }
+            }
+
+            throw new SnowflakeDbException(
+                SFError.INTERNAL_ERROR,
+                $"JWT Authentication failed after {MaxAuthRetries} attempts. Last error: {lastException?.Message}");
         }
 
         /// <see cref="IAuthenticator.Authenticate"/>
         public void Authenticate()
         {
-            jwtToken = GenerateJwtToken();
+            Exception lastException = null;
+            int backoffMs = InitialBackoffMs;
 
-            // Send the http request with the generate token
-            logger.Debug("Send login request");
-            base.Login();
+            for (int attempt = 1; attempt <= MaxAuthRetries; attempt++)
+            {
+                try
+                {
+                    // Generate fresh JWT token on every attempt (like Python connector)
+                    jwtToken = GenerateJwtToken();
+
+                    logger.Info($"JWT Authentication attempt {attempt}/{MaxAuthRetries}");
+                    base.Login();
+
+                    logger.Info("JWT Authentication successful");
+                    return;
+                }
+                catch (SnowflakeDbException ex) when (ShouldRetry(ex, attempt))
+                {
+                    lastException = ex;
+                    logger.Warn($"JWT auth attempt {attempt} failed with error {ex.ErrorCode}: {ex.Message}. Retrying with fresh token.");
+
+                    if (attempt < MaxAuthRetries)
+                    {
+                        int sleepTime = CalculateBackoff(backoffMs);
+                        logger.Debug($"Waiting {sleepTime}ms before retry...");
+                        Thread.Sleep(sleepTime);
+                        backoffMs = Math.Min(backoffMs * 2, MaxBackoffMs);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger.Error($"JWT Authentication failed with non-retryable error: {ex.Message}", ex);
+                    throw;
+                }
+            }
+
+            throw new SnowflakeDbException(
+                SFError.INTERNAL_ERROR,
+                $"JWT Authentication failed after {MaxAuthRetries} attempts. Last error: {lastException?.Message}");
         }
 
         /// <see cref="BaseAuthenticator.SetSpecializedAuthenticatorData(ref LoginRequestData)"/>
         protected override void SetSpecializedAuthenticatorData(ref LoginRequestData data)
         {
-            // Add the token to the Data attribute
             data.Token = jwtToken;
             SetSecondaryAuthenticationData(ref data);
         }
 
         /// <summary>
+        /// Determines if authentication should be retried based on the exception.
+        /// </summary>
+        private bool ShouldRetry(SnowflakeDbException ex, int attempt)
+        {
+            if (attempt >= MaxAuthRetries)
+                return false;
+
+            return s_retryableHttpCodes.Contains(ex.ErrorCode) ||
+                   s_retryableSnowflakeCodes.Contains(ex.ErrorCode);
+        }
+
+        /// <summary>
+        /// Calculates backoff time with jitter.
+        /// </summary>
+        private int CalculateBackoff(int baseBackoffMs)
+        {
+            int jitter = new Random().Next(-500, 500);
+            return Math.Max(100, baseBackoffMs + jitter);
+        }
+
+        /// <summary>
         /// Generates a JwtToken to use for login.
         /// </summary>
-        /// <returns>The generated JWT token.</returns>
         private string GenerateJwtToken()
         {
-            logger.Info("Key-pair Authentication");
+            logger.Debug("Generating JWT token for key-pair authentication");
 
             bool hasPkPath =
                 session.properties.TryGetValue(SFSessionProperty.PRIVATE_KEY_FILE, out var pkPath);
@@ -185,19 +295,15 @@ namespace Snowflake.Data.Core.Authenticator
                 //NotBefore
                 null,
                 // Expires
-                now.AddSeconds(60),
+                now.AddSeconds(JwtLifetimeSeconds),
                 //SigningCredentials
                 new SigningCredentials(
                     new RsaSecurityKey(rsaProvider), SecurityAlgorithms.RsaSha256)
             );
 
             // Serialize the jwt token
-            // Base64URL-encoded parts delimited by period ('.'), with format :
-            //     [header-base64url].[payload-base64url].[signature-base64url]
             var handler = new JwtSecurityTokenHandler();
-            string jwtToken = handler.WriteToken(token);
-
-            return jwtToken;
+            return handler.WriteToken(token);
         }
 
         private PemReader CreatePemReader(TextReader textReader, string privateKeyPassword)
@@ -218,27 +324,17 @@ namespace Snowflake.Data.Core.Authenticator
         /// </summary>
         private class PasswordFinder : IPasswordFinder
         {
-            // The password.
             private string password;
 
-            /// <summary>
-            /// Constructor.
-            /// </summary>
-            /// <param name="password">The password.</param>
             public PasswordFinder(string password)
             {
                 this.password = password;
             }
 
-            /// <summary>
-            /// Returns the password or null if the password is empty or null.
-            /// </summary>
-            /// <returns>The password or null if the password is empty or null.</returns>
             public char[] GetPassword()
             {
                 if ((null == password) || (0 == password.Length))
                 {
-                    // No password.
                     return null;
                 }
                 else
@@ -249,5 +345,3 @@ namespace Snowflake.Data.Core.Authenticator
         }
     }
 }
-
-

@@ -1,6 +1,8 @@
 #### For the official .NET Release Notes please refer to https://docs.snowflake.com/en/release-notes/clients-drivers/dotnet
 
 # Changelog
+- vX.X.X (Unreleased)
+    - Bug fix: JWT token is now regenerated during authentication retries to prevent 394303 (JWT_TOKEN_INVALID_EXPIRATION_TIME) errors when transient failures (503, 429, etc.) cause retries that exceed the 60-second token lifetime.
 - v5.3.0
     - Introduced shared library for extended telemetry to identify and prepare testing platform for native rust extensions.
 - v5.2.1
