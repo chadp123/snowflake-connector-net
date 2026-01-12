@@ -271,6 +271,9 @@ paket-files/
 .idea/
 *.sln.iml
 
+# VS Code / Cursor workspace files
+*.code-workspace
+
 # CodeRush
 .cr/
 

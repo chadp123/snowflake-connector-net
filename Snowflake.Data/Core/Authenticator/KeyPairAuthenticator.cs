@@ -21,27 +21,69 @@ namespace Snowflake.Data.Core.Authenticator
     /// <summary>
     /// KeyPairAuthenticator is used for Key pair based authentication.
     /// See <see cref="https://docs.snowflake.com/en/user-guide/key-pair-auth.html"/> for more information.
+    /// 
+    /// ROOT CAUSE OF JWT EXPIRATION ISSUES:
+    /// =====================================
+    /// JWT tokens have a hardcoded 60-second lifetime. When HTTP errors occur (e.g., 503 Service Unavailable),
+    /// the HTTP-level RetryHandler (in HttpUtil.cs) retries the request using the SAME JWT token.
+    /// If the total retry duration exceeds 60 seconds, the JWT expires, causing Snowflake to return
+    /// error 394303 (JWT_TOKEN_INVALID_EXPIRATION_TIME).
+    /// 
+    /// SOLUTION:
+    /// This implementation adds authenticator-level retry that regenerates the JWT token on each attempt,
+    /// matching the Python connector's behavior (see auth/keypair.py handle_timeout method).
+    /// 
+    /// INTERACTION WITH HTTP RETRY HANDLER:
+    /// - HTTP RetryHandler (HttpUtil.cs) handles transport-level retries for 503/5xx errors
+    /// - HTTP RetryHandler uses the SAME JWT token for all retries (this is the bug)
+    /// - This authenticator catches Snowflake error 394303 (JWT_TOKEN_INVALID_EXPIRATION_TIME) AFTER HTTP retries exhaust
+    /// - On catching this error, we regenerate the JWT and retry the entire authentication
+    /// - Other JWT errors (394304, 390144) are not retried as they indicate configuration/implementation issues
+    /// - The connection string parameters MAXHTTPRETRIES and RETRY_TIMEOUT still control HTTP-level retries
+    /// 
+    /// RETRY CONFIGURATION:
+    /// - MaxAuthRetries: Number of times to regenerate JWT and retry (default: 3)
+    /// - HTTP retries: Controlled by MAXHTTPRETRIES connection string parameter (default: 7)
+    /// - Total worst-case attempts: MaxAuthRetries * MAXHTTPRETRIES
     /// </summary>
     class KeyPairAuthenticator : BaseAuthenticator, IAuthenticator
     {
         // The authenticator setting value to use to authenticate using key pair authentication.
         public const string AUTH_NAME = "snowflake_jwt";
 
-        // Retry configuration constants
+        /// <summary>
+        /// Maximum number of authentication retries with fresh JWT tokens.
+        /// This is separate from HTTP-level retries (MAXHTTPRETRIES).
+        /// </summary>
         private const int MaxAuthRetries = 3;
+        
+        /// <summary>
+        /// JWT token lifetime in seconds. Matches JDBC/ODBC drivers.
+        /// Python uses 60s by default but allows override via JWT_LIFETIME_IN_SECONDS env var.
+        /// </summary>
         private const int JwtLifetimeSeconds = 60;
+        
+        /// <summary>
+        /// Initial backoff between authenticator-level retries in milliseconds.
+        /// </summary>
         private const int InitialBackoffMs = 1000;
+        
+        /// <summary>
+        /// Maximum backoff between authenticator-level retries in milliseconds.
+        /// </summary>
         private const int MaxBackoffMs = 8000;
 
-        // Retryable Snowflake error codes for JWT authentication
+        /// <summary>
+        /// Snowflake error code that indicates JWT token expiration and should trigger retry with fresh token.
+        /// Only 394303 (JWT_TOKEN_INVALID_EXPIRATION_TIME) is retryable - it occurs when the JWT expires
+        /// during HTTP-level retries.
+        /// 
+        /// Other JWT errors (394304 PUBLIC_KEY_FINGERPRINT_MISMATCH, 390144 JWT_TOKEN_INVALID) indicate
+        /// configuration or implementation errors that won't be fixed by regenerating the JWT.
+        /// </summary>
         private static readonly int[] s_retryableSnowflakeCodes = {
-            394303,  // JWT_TOKEN_INVALID_EXPIRATION_TIME
-            394304,  // JWT_TOKEN_INVALID_PUBLIC_KEY_FINGERPRINT_MISMATCH
-            390144,  // JWT_TOKEN_INVALID
+            394303,  // JWT_TOKEN_INVALID_EXPIRATION_TIME - JWT expired during HTTP retries
         };
-
-        // Retryable HTTP status codes
-        private static readonly int[] s_retryableHttpCodes = { 500, 502, 503, 504, 408, 429 };
 
         // The logger.
         private static readonly SFLogger logger =
@@ -78,10 +120,14 @@ namespace Snowflake.Data.Core.Authenticator
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    // Generate fresh JWT token on every attempt (like Python connector)
+                    // Generate fresh JWT token on every attempt (matches Python connector pattern)
+                    // This ensures JWT never expires during HTTP-level retries
                     jwtToken = GenerateJwtToken();
 
                     logger.Info($"JWT Authentication async attempt {attempt}/{MaxAuthRetries}");
+                    
+                    // Login() will use HTTP RetryHandler for transport-level retries (503, etc.)
+                    // If JWT expires during those retries, we'll catch the error below
                     await base.LoginAsync(cancellationToken).ConfigureAwait(false);
 
                     logger.Info("JWT Authentication successful");
@@ -94,7 +140,8 @@ namespace Snowflake.Data.Core.Authenticator
                 catch (SnowflakeDbException ex) when (ShouldRetry(ex, attempt))
                 {
                     lastException = ex;
-                    logger.Warn($"JWT auth async attempt {attempt} failed with error {ex.ErrorCode}: {ex.Message}. Retrying with fresh token.");
+                    logger.Warn($"JWT auth async attempt {attempt} failed with Snowflake error {ex.ErrorCode}: {ex.Message}. " +
+                               $"Regenerating JWT token for retry.");
 
                     if (attempt < MaxAuthRetries)
                     {
@@ -126,10 +173,14 @@ namespace Snowflake.Data.Core.Authenticator
             {
                 try
                 {
-                    // Generate fresh JWT token on every attempt (like Python connector)
+                    // Generate fresh JWT token on every attempt (matches Python connector pattern)
+                    // This ensures JWT never expires during HTTP-level retries
                     jwtToken = GenerateJwtToken();
 
                     logger.Info($"JWT Authentication attempt {attempt}/{MaxAuthRetries}");
+                    
+                    // Login() will use HTTP RetryHandler for transport-level retries (503, etc.)
+                    // If JWT expires during those retries, we'll catch the error below
                     base.Login();
 
                     logger.Info("JWT Authentication successful");
@@ -138,7 +189,8 @@ namespace Snowflake.Data.Core.Authenticator
                 catch (SnowflakeDbException ex) when (ShouldRetry(ex, attempt))
                 {
                     lastException = ex;
-                    logger.Warn($"JWT auth attempt {attempt} failed with error {ex.ErrorCode}: {ex.Message}. Retrying with fresh token.");
+                    logger.Warn($"JWT auth attempt {attempt} failed with Snowflake error {ex.ErrorCode}: {ex.Message}. " +
+                               $"Regenerating JWT token for retry.");
 
                     if (attempt < MaxAuthRetries)
                     {
@@ -168,19 +220,21 @@ namespace Snowflake.Data.Core.Authenticator
         }
 
         /// <summary>
-        /// Determines if authentication should be retried based on the exception.
+        /// Determines if authentication should be retried based on the Snowflake error code.
+        /// Only retries on JWT-specific errors - HTTP transport errors are handled by RetryHandler.
         /// </summary>
         private bool ShouldRetry(SnowflakeDbException ex, int attempt)
         {
             if (attempt >= MaxAuthRetries)
                 return false;
 
-            return s_retryableHttpCodes.Contains(ex.ErrorCode) ||
-                   s_retryableSnowflakeCodes.Contains(ex.ErrorCode);
+            // Only retry on Snowflake JWT errors, not HTTP errors
+            // HTTP errors (503, etc.) are handled by the HTTP RetryHandler
+            return s_retryableSnowflakeCodes.Contains(ex.ErrorCode);
         }
 
         /// <summary>
-        /// Calculates backoff time with jitter.
+        /// Calculates backoff time with jitter to prevent thundering herd.
         /// </summary>
         private int CalculateBackoff(int baseBackoffMs)
         {
@@ -189,7 +243,8 @@ namespace Snowflake.Data.Core.Authenticator
         }
 
         /// <summary>
-        /// Generates a JwtToken to use for login.
+        /// Generates a fresh JWT token for authentication.
+        /// Called at the start of each authentication attempt to ensure token validity.
         /// </summary>
         private string GenerateJwtToken()
         {
@@ -267,9 +322,10 @@ namespace Snowflake.Data.Core.Authenticator
              *      iss : $accountName.$userName.$publicKeyFingerprint
              *      sub : $accountName.$userName
              *      iat : $now
-             *      exp : $now + LIFETIME
+             *      exp : $now + LIFETIME (60 seconds)
              *
-             * Note : Lifetime = 120sec for Python impl, 60sec for Jdbc and Odbc
+             * Note: Lifetime = 120sec for Python impl, 60sec for Jdbc/Odbc/.NET
+             * The short lifetime is why we must regenerate on retries.
             */
             String accountUser =
                 session.properties[SFSessionProperty.ACCOUNT].ToUpper() +
@@ -294,7 +350,7 @@ namespace Snowflake.Data.Core.Authenticator
                 claims,
                 //NotBefore
                 null,
-                // Expires
+                // Expires - 60 second lifetime
                 now.AddSeconds(JwtLifetimeSeconds),
                 //SigningCredentials
                 new SigningCredentials(
@@ -324,13 +380,22 @@ namespace Snowflake.Data.Core.Authenticator
         /// </summary>
         private class PasswordFinder : IPasswordFinder
         {
+            // The password.
             private string password;
 
+            /// <summary>
+            /// Constructor.
+            /// </summary>
+            /// <param name="password">The password.</param>
             public PasswordFinder(string password)
             {
                 this.password = password;
             }
 
+            /// <summary>
+            /// Returns the password or null if the password is empty or null.
+            /// </summary>
+            /// <returns>The password or null.</returns>
             public char[] GetPassword()
             {
                 if ((null == password) || (0 == password.Length))
